@@ -1,0 +1,189 @@
+#include <UIPEthernet.h>
+#include <PubSubClient.h>
+#include <SPI.h>
+
+// ---------------- PIN DEFINITIONS ----------------
+#define RELAY_PIN   7
+#define LED_POWER   5
+#define LED_MQTT    6
+#define LED_RELAY   8
+
+// ---------------- NETWORK ----------------
+byte mac[] = {0xAC,0x0A,0xE7,0xFF,0xDC,0x36};
+
+IPAddress mqttServer(192,168,1,250);
+const int mqttPort = 1883;
+
+// ---------------- STATIC IP ----------------
+IPAddress staticIP(192,168,1,36);
+IPAddress gateway(192,168,1,1);
+IPAddress subnet(255,255,255,0);
+IPAddress dnsServer(192,168,1,1);
+
+// ---------------- TOPICS ----------------
+const char pubTopic[] = "pub1/AC0AE7FFDC36";
+const char subTopic[] = "sub1/AC0AE7FFDC36";
+
+// ---------------- OBJECTS ----------------
+EthernetClient ethClient;
+PubSubClient client(ethClient);
+
+// ---------------- VARIABLES ----------------
+bool relayState = LOW;
+unsigned long lastPublish = 0;
+
+// =====================================================
+// APPLY RELAY
+// =====================================================
+void applyRelay(bool state)
+{
+  relayState = state;
+
+  digitalWrite(RELAY_PIN, state);
+  digitalWrite(LED_RELAY, state);
+}
+
+// =====================================================
+// PUBLISH STATUS
+// =====================================================
+void publishStatus()
+{
+  IPAddress ip = Ethernet.localIP();
+
+  char ipStr[16];
+  sprintf(ipStr,
+          "%u.%u.%u.%u",
+          ip[0], ip[1], ip[2], ip[3]);
+
+  char macStr[18];
+  sprintf(macStr,
+          "%02X:%02X:%02X:%02X:%02X:%02X",
+          mac[0], mac[1], mac[2],
+          mac[3], mac[4], mac[5]);
+
+  int lockVal = relayState ? 1 : 0;
+
+  char msg[220];
+
+  sprintf(msg,
+    "{\"data\":{\"mac\":\"%s\",\"status\":{\"lock1\":%d},\"network\":{\"wlan0\":{\"ip\":\"%s\"}}}}",
+    macStr,
+    lockVal,
+    ipStr
+  );
+
+  if(client.publish(pubTopic, msg))
+  {
+    digitalWrite(LED_MQTT, HIGH);
+    delay(40);
+    digitalWrite(LED_MQTT, LOW);
+  }
+}
+
+// =====================================================
+// MQTT CALLBACK
+// =====================================================
+void callback(char* topic, byte* payload, unsigned int length)
+{
+  char msg[64];
+
+  memset(msg, 0, sizeof(msg));
+
+  if(length > sizeof(msg) - 1)
+  {
+    length = sizeof(msg) - 1;
+  }
+
+  memcpy(msg, payload, length);
+
+  // -------- UNLOCK1 --------
+  if(strstr(msg, "UNLOCK1") != NULL)
+  {
+    applyRelay(LOW);
+    publishStatus();
+    return;
+  }
+
+  // -------- LOCK1 --------
+  if(strstr(msg, "LOCK1") != NULL)
+  {
+    applyRelay(HIGH);
+    publishStatus();
+    return;
+  }
+}
+
+// =====================================================
+// MQTT RECONNECT
+// =====================================================
+void reconnect()
+{
+  while (!client.connected())
+  {
+    if (client.connect("RelayClient_FE89"))
+    {
+      client.subscribe(subTopic);
+
+      // MQTT Connected indication
+      digitalWrite(LED_RELAY, HIGH);
+      delay(300);
+      digitalWrite(LED_RELAY, LOW);
+
+      publishStatus();
+    }
+    else
+    {
+      delay(2000);
+    }
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup()
+{
+  pinMode(10, OUTPUT);
+  digitalWrite(10, HIGH);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(LED_POWER, OUTPUT);
+  pinMode(LED_MQTT, OUTPUT);
+  pinMode(LED_RELAY, OUTPUT);
+
+  digitalWrite(LED_POWER, HIGH);
+
+  applyRelay(LOW);
+
+  Ethernet.begin(
+      mac,
+      staticIP,
+      dnsServer,
+      gateway,
+      subnet);
+
+  delay(2000);
+
+  client.setServer(mqttServer, mqttPort);
+  client.setCallback(callback);
+  client.setBufferSize(256);
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop()
+{
+  if (!client.connected())
+  {
+    reconnect();
+  }
+
+  client.loop();
+
+  if (millis() - lastPublish >= 2000)
+  {
+    lastPublish = millis();
+    publishStatus();
+  }
+}
