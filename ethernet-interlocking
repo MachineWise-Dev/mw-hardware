@@ -1,6 +1,7 @@
 #include <UIPEthernet.h>
 #include <PubSubClient.h>
 #include <SPI.h>
+#include <avr/wdt.h>
 
 // ---------------- PIN DEFINITIONS ----------------
 #define RELAY_PIN   7
@@ -9,20 +10,20 @@
 #define LED_RELAY   8
 
 // ---------------- NETWORK ----------------
-byte mac[] = {0xAC,0x0A,0xE7,0xFF,0xDC,0x36};
+byte mac[] = {0xAC,0x0A,0xE7,0xFF,0xDC,0x06};
 
-IPAddress mqttServer(192,168,1,250);
+IPAddress mqttServer(192,168,8,109);
 const int mqttPort = 1883;
 
 // ---------------- STATIC IP ----------------
-IPAddress staticIP(192,168,1,36);
+IPAddress staticIP(192,168,8,210);
 IPAddress gateway(192,168,1,1);
 IPAddress subnet(255,255,255,0);
 IPAddress dnsServer(192,168,1,1);
 
 // ---------------- TOPICS ----------------
-const char pubTopic[] = "pub1/AC0AE7FFDC36";
-const char subTopic[] = "sub1/AC0AE7FFDC36";
+const char pubTopic[] = "pub1/AC0AE7FFDC06/";
+const char subTopic[] = "sub1/AC0AE7FFDC06/";
 
 // ---------------- OBJECTS ----------------
 EthernetClient ethClient;
@@ -30,17 +31,21 @@ PubSubClient client(ethClient);
 
 // ---------------- VARIABLES ----------------
 bool relayState = LOW;
+
 unsigned long lastPublish = 0;
+unsigned long lastRestart = 0;
+
+unsigned long seqCounter = 0;
 
 // =====================================================
 // APPLY RELAY
 // =====================================================
 void applyRelay(bool state)
 {
-  relayState = state;
+    relayState = state;
 
-  digitalWrite(RELAY_PIN, state);
-  digitalWrite(LED_RELAY, state);
+    digitalWrite(RELAY_PIN, state);
+    digitalWrite(LED_RELAY, state);
 }
 
 // =====================================================
@@ -48,36 +53,42 @@ void applyRelay(bool state)
 // =====================================================
 void publishStatus()
 {
-  IPAddress ip = Ethernet.localIP();
+    if(!client.connected())
+        return;
 
-  char ipStr[16];
-  sprintf(ipStr,
-          "%u.%u.%u.%u",
-          ip[0], ip[1], ip[2], ip[3]);
+    seqCounter++;
 
-  char macStr[18];
-  sprintf(macStr,
-          "%02X:%02X:%02X:%02X:%02X:%02X",
-          mac[0], mac[1], mac[2],
-          mac[3], mac[4], mac[5]);
+    char macStr[18];
 
-  int lockVal = relayState ? 1 : 0;
+    sprintf(
+        macStr,
+        "%02X:%02X:%02X:%02X:%02X:%02X",
+        mac[0],
+        mac[1],
+        mac[2],
+        mac[3],
+        mac[4],
+        mac[5]
+    );
 
-  char msg[220];
+    int lockVal = relayState ? 1 : 0;
 
-  sprintf(msg,
-    "{\"data\":{\"mac\":\"%s\",\"status\":{\"lock1\":%d},\"network\":{\"wlan0\":{\"ip\":\"%s\"}}}}",
-    macStr,
-    lockVal,
-    ipStr
-  );
+    char msg[120];
 
-  if(client.publish(pubTopic, msg))
-  {
-    digitalWrite(LED_MQTT, HIGH);
-    delay(40);
-    digitalWrite(LED_MQTT, LOW);
-  }
+    sprintf(
+        msg,
+        "{\"data\":{\"mac\":\"%s\",\"status\":{\"lock1\":%d},\"seq\":%lu}}",
+        macStr,
+        lockVal,
+        seqCounter
+    );
+
+    if(client.publish(pubTopic,msg))
+    {
+        digitalWrite(LED_MQTT,HIGH);
+        delay(40);
+        digitalWrite(LED_MQTT,LOW);
+    }
 }
 
 // =====================================================
@@ -85,32 +96,32 @@ void publishStatus()
 // =====================================================
 void callback(char* topic, byte* payload, unsigned int length)
 {
-  char msg[64];
+    char msg[64];
 
-  memset(msg, 0, sizeof(msg));
+    memset(msg,0,sizeof(msg));
 
-  if(length > sizeof(msg) - 1)
-  {
-    length = sizeof(msg) - 1;
-  }
+    if(length > sizeof(msg)-1)
+    {
+        length = sizeof(msg)-1;
+    }
 
-  memcpy(msg, payload, length);
+    memcpy(msg,payload,length);
 
-  // -------- UNLOCK1 --------
-  if(strstr(msg, "UNLOCK1") != NULL)
-  {
-    applyRelay(LOW);
-    publishStatus();
-    return;
-  }
+    // -------- UNLOCK1 --------
+    if(strstr(msg,"UNLOCK1") != NULL)
+    {
+        applyRelay(LOW);
+        publishStatus();
+        return;
+    }
 
-  // -------- LOCK1 --------
-  if(strstr(msg, "LOCK1") != NULL)
-  {
-    applyRelay(HIGH);
-    publishStatus();
-    return;
-  }
+    // -------- LOCK1 --------
+    if(strstr(msg,"LOCK1") != NULL)
+    {
+        applyRelay(HIGH);
+        publishStatus();
+        return;
+    }
 }
 
 // =====================================================
@@ -118,24 +129,23 @@ void callback(char* topic, byte* payload, unsigned int length)
 // =====================================================
 void reconnect()
 {
-  while (!client.connected())
-  {
-    if (client.connect("RelayClient_FE89"))
+    while(!client.connected())
     {
-      client.subscribe(subTopic);
+        if(client.connect("AC0AE7FFDC06/"))
+        {
+            client.subscribe(subTopic);
 
-      // MQTT Connected indication
-      digitalWrite(LED_RELAY, HIGH);
-      delay(300);
-      digitalWrite(LED_RELAY, LOW);
+            digitalWrite(LED_RELAY,HIGH);
+            delay(300);
+            digitalWrite(LED_RELAY,LOW);
 
-      publishStatus();
+            publishStatus();
+        }
+        else
+        {
+            delay(2000);
+        }
     }
-    else
-    {
-      delay(2000);
-    }
-  }
 }
 
 // =====================================================
@@ -143,30 +153,40 @@ void reconnect()
 // =====================================================
 void setup()
 {
-  pinMode(10, OUTPUT);
-  digitalWrite(10, HIGH);
+    wdt_enable(WDTO_8S);
 
-  pinMode(RELAY_PIN, OUTPUT);
-  pinMode(LED_POWER, OUTPUT);
-  pinMode(LED_MQTT, OUTPUT);
-  pinMode(LED_RELAY, OUTPUT);
+    pinMode(10,OUTPUT);
+    digitalWrite(10,HIGH);
 
-  digitalWrite(LED_POWER, HIGH);
+    pinMode(RELAY_PIN,OUTPUT);
+    pinMode(LED_POWER,OUTPUT);
+    pinMode(LED_MQTT,OUTPUT);
+    pinMode(LED_RELAY,OUTPUT);
 
-  applyRelay(LOW);
+    digitalWrite(LED_POWER,HIGH);
 
-  Ethernet.begin(
-      mac,
-      staticIP,
-      dnsServer,
-      gateway,
-      subnet);
+    applyRelay(LOW);
 
-  delay(2000);
+    Ethernet.begin(
+        mac,
+        staticIP,
+        dnsServer,
+        gateway,
+        subnet
+    );
 
-  client.setServer(mqttServer, mqttPort);
-  client.setCallback(callback);
-  client.setBufferSize(256);
+    delay(2000);
+
+    client.setServer(
+        mqttServer,
+        mqttPort
+    );
+
+    client.setCallback(callback);
+
+    client.setBufferSize(256);
+
+    lastRestart = millis();
 }
 
 // =====================================================
@@ -174,16 +194,30 @@ void setup()
 // =====================================================
 void loop()
 {
-  if (!client.connected())
-  {
-    reconnect();
-  }
+    wdt_reset();
 
-  client.loop();
+    if(!client.connected())
+    {
+        reconnect();
+    }
 
-  if (millis() - lastPublish >= 2000)
-  {
-    lastPublish = millis();
-    publishStatus();
-  }
+    client.loop();
+
+    // publish every 2 sec
+    if(millis()-lastPublish>=2000)
+    {
+        lastPublish=millis();
+
+        publishStatus();
+    }
+
+    // restart every 1 hour
+    if(millis()-lastRestart>=3600000UL)
+    {
+        wdt_enable(WDTO_15MS);
+
+        while(1)
+        {
+        }
+    }
 }
