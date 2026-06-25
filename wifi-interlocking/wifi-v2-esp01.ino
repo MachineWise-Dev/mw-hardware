@@ -1,531 +1,394 @@
-```cpp
-// =====================================================
-// ESP8266 QR + MQTT + API INTERLOCK SYSTEM
-//
-// Functions:
-// 1. Connects to WiFi (2 SSIDs supported)
-// 2. Connects to MQTT broker
-// 3. Receives QR from ATmega
-// 4. Sends QR to API
-// 5. Receives LOCK/UNLOCK MQTT commands
-// 6. Sends commands to ATmega
-// 7. Publishes status periodically
-// =====================================================
-
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 #include <ESP8266HTTPClient.h>
+#include <EEPROM.h>
 
-// =====================================================
-// WIFI CREDENTIALS
-// First WiFi is attempted.
-// If it fails, second WiFi is attempted.
-// =====================================================
-const char* ssid1="MachineWise";
-const char* pass1="MachineWise";
+#define EEPROM_SIZE 512
+#define MAX_QR_LEN 200
+#define WIFI_TIMEOUT 15000
+#define WIFI_RETRY 5000
 
-const char* ssid2="MachineWise-Electronics";
-const char* pass2="Machine@123";
+struct Config
+{
+char ssid[32];
+char password[64];
+char mqttServer[64];
+uint16_t mqttPort;
+char apiURL[120];
+};
 
-// =====================================================
-// MQTT SERVER DETAILS
-// =====================================================
-const char* mqtt_server="178.236.185.7";
+Config config;
 
-// =====================================================
-// API BASE URL
-// QR value is appended at end
-// =====================================================
-String baseURL="http://178.236.185.7:2999/v1/";
+const char* DEFAULT_SSID="MachineWise";
+const char* DEFAULT_PASS="MachineWise";
 
 WiFiClient espClient;
-PubSubClient client(espClient);
+PubSubClient mqttClient(espClient);
 
-// =====================================================
-// GLOBAL VARIABLES
-// =====================================================
+String mqtt_server="";
+String baseURL="";
+
 String lastQR="";
 String mqttCmd="";
-String qrResult="";
-
 String macID="";
 String pubTopic="";
 String subTopic="";
 
+char serialLine[MAX_QR_LEN+1];
+
+int serialLen=0;
 int relayState=0;
 int httpCodeVal=0;
 
+bool wifiConnecting=false;
+bool triedDefaultWiFi=false;
+
+unsigned long wifiStartTime=0;
+unsigned long lastWifiAttempt=0;
 unsigned long lastMQTT=0;
+unsigned long lastMQTTConnect=0;
 
-
-// =====================================================
-// CONNECT TO SINGLE WIFI
-//
-// Tries connection for 8 seconds
-// =====================================================
-void connectWiFi(const char* ssid,const char* password)
+void saveConfig()
 {
-    Serial.println("Trying WiFi");
-    Serial.print("SSID: ");
-    Serial.println(ssid);
-
-    WiFi.begin(ssid,password);
-
-    unsigned long start=millis();
-
-    while(WiFi.status()!=WL_CONNECTED &&
-          millis()-start<8000)
-    {
-        Serial.print(".");
-        delay(300);
-    }
-
-    Serial.println();
-
-    if(WiFi.status()==WL_CONNECTED)
-    {
-        Serial.println("WiFi Connected");
-
-        Serial.print("IP: ");
-        Serial.println(WiFi.localIP());
-    }
-    else
-    {
-        Serial.println("WiFi Failed");
-    }
+ EEPROM.put(0,config);
+ EEPROM.commit();
 }
 
-
-// =====================================================
-// TRY WIFI1 THEN WIFI2
-// =====================================================
-void setup_wifi()
+void loadConfig()
 {
-    Serial.println("Starting WiFi setup");
+ EEPROM.get(0,config);
 
-    WiFi.mode(WIFI_STA);
+ if(config.ssid[0]==0xFF ||
+ config.ssid[0]=='\0')
+ {
+   strcpy(config.ssid,DEFAULT_SSID);
 
-    connectWiFi(ssid1,pass1);
+   strcpy(config.password,DEFAULT_PASS);
 
-    if(WiFi.status()==WL_CONNECTED)
-        return;
+   strcpy(config.mqttServer,
+   "178.236.185.7");
 
-    connectWiFi(ssid2,pass2);
+   config.mqttPort=1883;
 
-    if(WiFi.status()==WL_CONNECTED)
-        return;
+   strcpy(
+   config.apiURL,
+   "http://178.236.185.7:2999/v1/");
 
-    while(WiFi.status()!=WL_CONNECTED)
-    {
-        connectWiFi(ssid1,pass1);
+   saveConfig();
+ }
 
-        if(WiFi.status()==WL_CONNECTED)
-            break;
+ mqtt_server=
+ String(config.mqttServer);
 
-        connectWiFi(ssid2,pass2);
-    }
+ baseURL=
+ String(config.apiURL);
 }
 
-
-// =====================================================
-// API CALL
-//
-// Sends QR to server
-// Returns HTTP response code
-// =====================================================
-int callAPI(String qr)
+void startWiFi()
 {
-    Serial.println("Calling API");
+ WiFi.mode(WIFI_STA);
 
-    HTTPClient http;
+ WiFi.begin(
+ config.ssid,
+ config.password);
 
-    String url=baseURL+qr;
+ wifiConnecting=true;
 
-    Serial.print("URL: ");
-    Serial.println(url);
-
-    http.begin(espClient,url);
-
-    int code=http.GET();
-
-    Serial.print("HTTP Response: ");
-    Serial.println(code);
-
-    http.end();
-
-    return code;
+ wifiStartTime=millis();
 }
 
-
-// =====================================================
-// SEND COMMAND TO ARDUINO
-// =====================================================
-void sendToArduino(String cmd)
+void connectWiFi()
 {
-    Serial.print("Sending To Arduino: ");
-    Serial.println(cmd);
+ if(WiFi.status()==WL_CONNECTED)
+ {
+   wifiConnecting=false;
+   return;
+ }
 
-    Serial.println(cmd);
+ unsigned long now=millis();
 
-    delay(100);
+ if(wifiConnecting)
+ {
+   if(now-wifiStartTime>WIFI_TIMEOUT)
+   {
+      WiFi.disconnect();
 
-    Serial.println(cmd);
+      wifiConnecting=false;
+
+      if(!triedDefaultWiFi)
+      {
+          WiFi.begin(
+          DEFAULT_SSID,
+          DEFAULT_PASS);
+
+          triedDefaultWiFi=true;
+
+          wifiConnecting=true;
+
+          wifiStartTime=millis();
+      }
+   }
+
+   return;
+ }
+
+ if(now-lastWifiAttempt<WIFI_RETRY)
+ return;
+
+ lastWifiAttempt=now;
+
+ WiFi.begin(
+ config.ssid,
+ config.password);
+
+ wifiConnecting=true;
+
+ wifiStartTime=millis();
 }
 
-
-// =====================================================
-// SEND MQTT STATUS
-// =====================================================
-void sendMQTT()
-{
-    if(!client.connected())
-    {
-        Serial.println("MQTT not connected");
-        return;
-    }
-
-    String qrToSend="";
-
-    if(lastQR.length()>0)
-        qrToSend=lastQR;
-    else
-        qrToSend=qrResult;
-
-    String payload="{";
-    payload+="\"data\":{";
-    payload+="\"qr\":\""+qrToSend+"\",";
-    payload+="\"status\":{";
-    payload+="\"lock1\":"+String(relayState)+",";
-    payload+="\"status-code\":"+String(httpCodeVal);
-    payload+="}}}";
-
-    Serial.println("Publishing MQTT");
-    Serial.println(payload);
-
-    if(client.publish(
-        pubTopic.c_str(),
-        payload.c_str()))
-    {
-        Serial.println("MQTT_SENT");
-
-        sendToArduino("MQTT_BLINK");
-    }
-}
-
-
-// =====================================================
-// MQTT MESSAGE RECEIVED
-// =====================================================
-void callback(
+void mqttCallback(
 char* topic,
 byte* payload,
 unsigned int length)
 {
-    Serial.println("MQTT message received");
+ mqttCmd="";
 
-    mqttCmd="";
+ for(int i=0;i<length;i++)
+ {
+   mqttCmd+=(char)payload[i];
+ }
 
-    for(int i=0;i<length;i++)
-    {
-        mqttCmd+=(char)payload[i];
-    }
-
-    mqttCmd.trim();
-
-    Serial.print("MQTT Command: ");
-    Serial.println(mqttCmd);
+ mqttCmd.trim();
+ mqttCmd.toUpperCase();
 }
 
-// =====================================================
-// MQTT RECONNECT
-//
-// Continuously attempts MQTT connection
-// Uses MAC address as client ID
-// =====================================================
-void reconnect()
+void reconnectMQTT()
 {
-    Serial.println("Entering reconnect()");
+ if(mqttClient.connected())
+ return;
 
-    while(!client.connected())
-    {
-        Serial.println("Connecting MQTT...");
+ if(millis()-lastMQTTConnect<5000)
+ return;
 
-        Serial.print("Client ID: ");
-        Serial.println(macID);
+ lastMQTTConnect=millis();
 
-        if(client.connect(macID.c_str()))
-        {
-            Serial.println("MQTT Connected");
+ mqttClient.setServer(
+ mqtt_server.c_str(),
+ config.mqttPort);
 
-            client.subscribe(
-            subTopic.c_str());
+ if(mqttClient.connect(
+ macID.c_str()))
+ {
+   mqttClient.subscribe(
+   subTopic.c_str());
 
-            Serial.print("Subscribed Topic: ");
-            Serial.println(subTopic);
-
-            sendMQTT();
-        }
-        else
-        {
-            Serial.println("MQTT Connection Failed");
-
-            Serial.print("MQTT State: ");
-            Serial.println(client.state());
-
-            delay(1500);
-        }
-    }
+   sendMQTT();
+ }
 }
 
-
-// =====================================================
-// SETUP
-//
-// Runs once after power ON
-//
-// Tasks:
-// 1.Start Serial
-// 2.Connect WiFi
-// 3.Generate MAC ID
-// 4.Create MQTT topics
-// 5.Configure MQTT
-// 6.Send initial unlock
-// =====================================================
-void setup()
+int callAPI(String qr)
 {
-    Serial.begin(9600);
+ HTTPClient http;
 
-    Serial.println();
-    Serial.println("System Starting");
+ http.setTimeout(5000);
 
-    delay(1000);
+ String url=
+ baseURL+qr;
 
-    setup_wifi();
+ http.begin(
+ espClient,
+ url);
 
-    macID=WiFi.macAddress();
+ int code=
+ http.GET();
 
-    Serial.print("Original MAC: ");
-    Serial.println(macID);
+ http.end();
 
-    macID.replace(":","");
+ return code;
+}
 
-    Serial.print("Modified MAC: ");
-    Serial.println(macID);
+void sendToArduino(String cmd)
+{
+ Serial.println(cmd);
+ delay(30);
+}
 
-    pubTopic=
-    "pub1/"+macID;
+void sendMQTT()
+{
+ if(!mqttClient.connected())
+ return;
 
-    subTopic=
-    "sub1/"+macID;
+ int rssiVal=0;
 
-    Serial.print("Publish Topic: ");
-    Serial.println(pubTopic);
+ if(WiFi.status()==WL_CONNECTED)
+ rssiVal=WiFi.RSSI();
 
-    Serial.print("Subscribe Topic: ");
-    Serial.println(subTopic);
+ String payload=
+ "{\"data\":{\"qr\":\""+
+ lastQR+
+ "\",\"status\":{\"lock1\":"+
+ String(relayState)+
+ ",\"status-code\":"+
+ String(httpCodeVal)+
+ ",\"rssi\":"+
+ String(rssiVal)+
+ "}}}";
 
-    client.setServer(
-    mqtt_server,
-    1883);
+ mqttClient.publish(
+ pubTopic.c_str(),
+ payload.c_str());
+}
 
-    Serial.println("MQTT Server Configured");
+void processSerialLine(char* line)
+{
+ if(strncmp(line,"QR:",3)!=0)
+ return;
 
-    client.setCallback(
-    callback);
+ lastQR=
+ String(line+3);
 
-    Serial.println("MQTT Callback Attached");
+ lastQR.trim();
 
+ if(lastQR.length()==0)
+ return;
+
+ sendMQTT();
+
+ httpCodeVal=
+ callAPI(lastQR);
+
+ if(httpCodeVal>=200 &&
+ httpCodeVal<300)
+ {
     relayState=0;
-
-    Serial.println("Relay initialized OFF");
 
     sendToArduino(
     "UNLOCK");
 
-    delay(500);
+    sendToArduino(
+    "QR_OK");
+ }
+ else
+ {
+    sendToArduino(
+    "QR_NOT_OK");
+ }
 
-    sendMQTT();
+ sendMQTT();
 
-    Serial.println("Setup Complete");
+ delay(300);
+
+ lastQR="";
 }
 
+void processArduinoSerial()
+{
+ while(Serial.available())
+ {
+   char c=
+   Serial.read();
 
-// =====================================================
-// LOOP
-//
-// Runs continuously forever
-//
-// Tasks:
-//
-// 1.Check MQTT connection
-// 2.Process MQTT messages
-// 3.Execute MQTT commands
-// 4.Receive QR data
-// 5.Call API
-// 6.Send QR status
-// 7.Publish MQTT every second
-// =====================================================
+   if(c=='\r')
+   continue;
+
+   if(c=='\n')
+   {
+      serialLine[serialLen]='\0';
+
+      processSerialLine(
+      serialLine);
+
+      serialLen=0;
+
+      return;
+   }
+
+   if(serialLen<MAX_QR_LEN)
+   {
+      serialLine[serialLen++]=c;
+   }
+ }
+}
+
+void processMQTTCommand()
+{
+ if(mqttCmd=="LOCK1")
+ {
+   relayState=1;
+
+   sendToArduino(
+   "LOCK");
+
+   sendMQTT();
+ }
+
+ else if(mqttCmd=="UNLOCK1")
+ {
+   relayState=0;
+
+   sendToArduino(
+   "UNLOCK");
+
+   sendMQTT();
+ }
+
+ mqttCmd="";
+}
+
+void setup()
+{
+ Serial.begin(9600);
+
+ EEPROM.begin(
+ EEPROM_SIZE);
+
+ loadConfig();
+
+ startWiFi();
+
+ macID=
+ WiFi.macAddress();
+
+ macID.replace(":","");
+
+ pubTopic=
+ "pub1/"+macID+"/";
+
+ subTopic=
+ "sub1/"+macID+"/";
+
+ mqttClient.setCallback(
+ mqttCallback);
+
+ mqttClient.setBufferSize(
+ 512);
+
+ relayState=0;
+
+ sendToArduino(
+ "UNLOCK");
+}
+
 void loop()
 {
-    // -------------------------------------
-    // Ensure MQTT remains connected
-    // -------------------------------------
-    if(!client.connected())
-    {
-        Serial.println("MQTT disconnected");
+ connectWiFi();
 
-        reconnect();
-    }
+ if(WiFi.status()==WL_CONNECTED)
+ {
+   reconnectMQTT();
 
-    client.loop();
+   mqttClient.loop();
+ }
 
+ processMQTTCommand();
 
-    // -------------------------------------
-    // MQTT COMMAND PROCESSING
-    // -------------------------------------
-    if(mqttCmd.length()>0)
-    {
-        Serial.print("Received Command: ");
-        Serial.println(mqttCmd);
+ processArduinoSerial();
 
-        if(
-        mqttCmd=="LOCK1"||
-        mqttCmd=="lock1")
-        {
-            Serial.println("Executing LOCK");
+ if(millis()-lastMQTT>2000)
+ {
+   lastMQTT=
+   millis();
 
-            relayState=1;
-
-            sendToArduino(
-            "LOCK");
-
-            sendMQTT();
-        }
-
-        else if(
-        mqttCmd=="UNLOCK1"||
-        mqttCmd=="unlock1")
-        {
-            Serial.println("Executing UNLOCK");
-
-            relayState=0;
-
-            sendToArduino(
-            "UNLOCK");
-
-            sendMQTT();
-        }
-
-        mqttCmd="";
-
-        Serial.println("MQTT command cleared");
-    }
-
-
-    // -------------------------------------
-    // QR RECEIVE SECTION
-    // -------------------------------------
-    if(Serial.available())
-    {
-        String data=
-        Serial.readStringUntil('\n');
-
-        data.trim();
-
-        Serial.print("Serial Received: ");
-        Serial.println(data);
-
-        if(data.startsWith("QR:"))
-        {
-            lastQR=
-            data.substring(3);
-
-            Serial.print("QR Value: ");
-            Serial.println(lastQR);
-
-            sendMQTT();
-
-            httpCodeVal=
-            callAPI(lastQR);
-
-
-            // --------------------------------
-            // SUCCESS RESPONSE
-            // --------------------------------
-            if(httpCodeVal>=200 &&
-               httpCodeVal<300)
-            {
-                Serial.println("QR Success");
-
-                qrResult=
-                "QR_OK";
-
-                if(relayState==1)
-                {
-                    relayState=0;
-
-                    Serial.println(
-                    "Unlocking Relay");
-
-                    sendToArduino(
-                    "UNLOCK");
-
-                    delay(250);
-
-                    sendMQTT();
-                }
-
-                Serial.println(
-                "QR_OK");
-
-                delay(50);
-
-                Serial.println(
-                "QR_OK");
-            }
-
-
-            // --------------------------------
-            // FAILURE RESPONSE
-            // --------------------------------
-            else
-            {
-                Serial.println(
-                "QR Failed");
-
-                qrResult=
-                "QR_NOT_OK";
-
-                Serial.println(
-                "QR_NOT_OK");
-
-                delay(50);
-
-                Serial.println(
-                "QR_NOT_OK");
-            }
-
-            lastQR="";
-
-            Serial.println(
-            "QR buffer cleared");
-
-            sendMQTT();
-        }
-    }
-
-
-    // -------------------------------------
-    // SEND MQTT EVERY SECOND
-    // -------------------------------------
-    if(millis()-lastMQTT>1000)
-    {
-        lastMQTT=
-        millis();
-
-        Serial.println(
-        "Periodic MQTT Update");
-
-        sendMQTT();
-    }
+   sendMQTT();
+ }
 }
